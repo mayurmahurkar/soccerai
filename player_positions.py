@@ -3,12 +3,12 @@ import supervision as sv
 import cv2
 import numpy as np
 
+from scripts.team import TeamClassifier
 from scripts.annotators import *
 from scripts.utils import *
 from scripts.football_pitch import *
-from scripts.team import TeamClassifier
 from scripts.view import ViewTransformer
-from tqdm import tqdm
+
 
 PLAYER_DETECTION_MODEL = YOLO("models/player_detect/weights/best.pt")
 FIELD_DETECTION_MODEL = YOLO("models/last_400.pt")
@@ -95,8 +95,8 @@ frame_reference_key_points = sv.KeyPoints(
 pitch_reference_points = np.array(CONFIG.vertices)[filter]
 
 transformer = ViewTransformer(
-    source=pitch_reference_points,
-    target=frame_reference_points
+    source=frame_reference_points,
+    target=pitch_reference_points
 )
 
 pitch_all_points = np.array(CONFIG.vertices)
@@ -127,8 +127,8 @@ pitch_players_xy = transformer.transform_points(points=players_xy)
 referees_xy = referees_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 pitch_referees_xy = transformer.transform_points(points=referees_xy)
 
-frame_reference_key_points = sv.KeyPoints(
-    xy=frame_reference_points[np.newaxis, ...])
+# frame_reference_key_points = sv.KeyPoints(
+#     xy=frame_reference_points[np.newaxis, ...])
 
 # visualize video game-style radar view
 annotated_frame = draw_pitch(CONFIG)

@@ -94,8 +94,8 @@ frame_reference_points = key_points.xy[0][filter]
 pitch_reference_points = np.array(CONFIG.vertices)[filter]
 
 transformer = ViewTransformer(
-    source=pitch_reference_points,
-    target=frame_reference_points
+    source=frame_reference_points,
+    target=pitch_reference_points
 )
 
 frame_ball_xy = ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
@@ -106,9 +106,6 @@ pitch_players_xy = transformer.transform_points(points=players_xy)
 
 referees_xy = referees_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
 pitch_referees_xy = transformer.transform_points(points=referees_xy)
-
-frame_reference_key_points = sv.KeyPoints(
-    xy=frame_reference_points[np.newaxis, ...])
 
 # visualize video game-style radar view
 annotated_frame = draw_pitch(CONFIG)
@@ -141,7 +138,7 @@ annotated_frame = draw_points_on_pitch(
     radius=16,
     pitch=annotated_frame)
 
-cv2.imwrite("output/annotated_frame_2.jpeg", annotated_frame)
+cv2.imwrite("output/annotated_pitch_1.jpeg", annotated_frame)
 
 # visualize voronoi diagram
 annotated_frame = draw_pitch(CONFIG)
@@ -193,5 +190,5 @@ annotated_frame = draw_points_on_pitch(
     thickness=1,
     pitch=annotated_frame)
 
-# cv2.imwrite("output/voronoi_diagram_blend.jpeg", annotated_frame)
+cv2.imwrite("output/voronoi_diagram_blend.jpeg", annotated_frame)
 
