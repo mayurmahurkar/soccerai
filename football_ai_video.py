@@ -29,6 +29,8 @@ GOALKEEPER_ID = 1
 PLAYER_ID = 2
 REFEREE_ID = 3
 BATCH_SIZE = 8  # Process 8 frames at a time
+FIELD_DETECTION_INTERVAL = 5  # Detect field every 5 frames
+MOTION_THRESHOLD = 30.0  # Threshold for motion detection
 
 tracker = sv.ByteTrack()
 tracker.reset()
@@ -110,6 +112,11 @@ if not video_writer_annotated.isOpened() or not video_writer_pitch.isOpened() or
 # Get frames from original video
 frame_generator = sv.get_video_frames_generator(SOURCE_VIDEO_PATH)
 
+# Field detection state variables
+last_detected_frame_num = 0
+last_keypoints = None
+keypoint_history = []  # Store [(frame_num, keypoints)] pairs
+
 # Process frames in batches for better performance
 start_time = time.time()
 batch_frames = []
@@ -122,15 +129,57 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
         
         # Process when we have a full batch or at the end of the video
         if len(batch_frames) == BATCH_SIZE or frame_count == total_frames:
-            # Run batch prediction for player detection
+            # Determine which frames need field detection using pure interval approach
+            frames_needing_field_detection = []
+            
+            for i, frame in enumerate(batch_frames):
+                absolute_frame_num = frame_count - len(batch_frames) + i + 1
+                
+                # Use fixed interval approach for field detection
+                if (absolute_frame_num % FIELD_DETECTION_INTERVAL == 1 or 
+                    len(keypoint_history) == 0):
+                    frames_needing_field_detection.append(i)
+            
+            # Run batch prediction for player detection for all frames
             player_results = PLAYER_DETECTION_MODEL.predict(batch_frames, verbose=False)
             
-            # Run batch prediction for field detection
-            pitch_results = FIELD_DETECTION_MODEL.predict(batch_frames, verbose=False)
+            # Run batch prediction for field detection only on frames that need it
+            field_detection_frames = [batch_frames[i] for i in frames_needing_field_detection]
+            pitch_results = [None] * len(batch_frames)  # Initialize with None for all frames
             
-            # Process frame detections first to collect all player crops for batch prediction
+            if field_detection_frames:
+                field_detection_results = FIELD_DETECTION_MODEL.predict(field_detection_frames, verbose=False)
+                
+                # Assign results to proper indices
+                for i, result_idx in enumerate(frames_needing_field_detection):
+                    pitch_results[result_idx] = field_detection_results[i]
+                    absolute_frame_num = frame_count - len(batch_frames) + result_idx + 1
+                    
+                    # Process and store keypoints for this frame
+                    key_points = sv.KeyPoints.from_ultralytics(field_detection_results[i])
+                    if len(key_points.xy) > 0 and len(key_points.confidence) > 0:
+                        filter_indices = key_points.confidence[0] > 0.5
+                        if np.any(filter_indices) and len(key_points.xy[0][filter_indices]) >= 4:
+                            frame_reference_points = key_points.xy[0][filter_indices]
+                            pitch_reference_points = np.array(CONFIG.vertices)[filter_indices]
+                            
+                            # Store for interpolation
+                            keypoint_data = {
+                                'frame_reference_points': frame_reference_points.copy(),
+                                'pitch_reference_points': pitch_reference_points.copy(),
+                                'confidence': key_points.confidence[0][filter_indices].copy()
+                            }
+                            
+                            # Add to history, keep only the most recent ones
+                            keypoint_history.append((absolute_frame_num, keypoint_data))
+                            if len(keypoint_history) > 5:  # Keep last 5 keyframes
+                                keypoint_history = keypoint_history[-5:]
+                                
+                            last_detected_frame_num = absolute_frame_num
+            
+            # Process frame detections to collect all player crops for batch prediction
             frame_data = []
-            for i, (frame, player_result, pitch_result) in enumerate(zip(batch_frames, player_results, pitch_results)):
+            for i, (frame, player_result) in enumerate(zip(batch_frames, player_results)):
                 # Ball, goalkeeper, player, referee detection
                 detections = sv.Detections.from_ultralytics(player_result)
                 
@@ -160,7 +209,8 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                         'goalkeepers_detections': goalkeepers_detections,
                         'referees_detections': referees_detections,
                         'players_crops': players_crops,
-                        'pitch_result': pitch_result
+                        'pitch_result': pitch_results[i],
+                        'absolute_frame_num': frame_count - len(batch_frames) + i + 1
                     })
                 else:
                     frame_data.append({
@@ -171,7 +221,8 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                         'goalkeepers_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
                         'referees_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
                         'players_crops': None,
-                        'pitch_result': pitch_result
+                        'pitch_result': pitch_results[i],
+                        'absolute_frame_num': frame_count - len(batch_frames) + i + 1
                     })
             
             # Batch predict team classifications
@@ -225,150 +276,226 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                     data['players_detections'], data['goalkeepers_detections']
                 ])
 
-                # Process pitch key points
-                key_points = sv.KeyPoints.from_ultralytics(data['pitch_result'])
-
-                # Make sure we have enough key points for transformation
-                if len(key_points.xy) > 0 and len(key_points.confidence) > 0:
-                    filter_indices = key_points.confidence[0] > 0.5
-                    if np.any(filter_indices):
-                        frame_reference_points = key_points.xy[0][filter_indices]
-                        pitch_reference_points = np.array(CONFIG.vertices)[filter_indices]
-
-                        # Only proceed if we have enough reference points
-                        if len(frame_reference_points) >= 4 and len(pitch_reference_points) >= 4:
+                # Get the frame number
+                frame_num = data['absolute_frame_num']
+                
+                # Determine keypoints source - either from direct detection or interpolation
+                transformer = None
+                
+                if data['pitch_result'] is not None:
+                    # If we have field detection for this frame, use it directly
+                    key_points = sv.KeyPoints.from_ultralytics(data['pitch_result'])
+                    if len(key_points.xy) > 0 and len(key_points.confidence) > 0:
+                        filter_indices = key_points.confidence[0] > 0.5
+                        if np.any(filter_indices) and len(key_points.xy[0][filter_indices]) >= 4:
+                            frame_reference_points = key_points.xy[0][filter_indices]
+                            pitch_reference_points = np.array(CONFIG.vertices)[filter_indices]
+                            
+                            if len(frame_reference_points) >= 4 and len(pitch_reference_points) >= 4:
+                                transformer = ViewTransformer(
+                                    source=frame_reference_points,
+                                    target=pitch_reference_points
+                                )
+                
+                elif len(keypoint_history) >= 2:
+                    # Use interpolation between keyframes when we have at least 2 keyframes
+                    # Find the closest keyframes before and after current frame
+                    before_frame = None
+                    after_frame = None
+                    before_keypoints = None
+                    after_keypoints = None
+                    
+                    for hist_frame_num, keypoints in keypoint_history:
+                        if hist_frame_num <= frame_num:
+                            if before_frame is None or hist_frame_num > before_frame:
+                                before_frame = hist_frame_num
+                                before_keypoints = keypoints
+                        if hist_frame_num >= frame_num:
+                            if after_frame is None or hist_frame_num < after_frame:
+                                after_frame = hist_frame_num
+                                after_keypoints = keypoints
+                    
+                    # If we have both before and after keyframes, interpolate
+                    if before_keypoints is not None and after_keypoints is not None:
+                        # Simple linear interpolation
+                        if after_frame == before_frame:
+                            # Same frame, no interpolation needed
+                            alpha = 0
+                        else:
+                            # Calculate interpolation factor
+                            alpha = (frame_num - before_frame) / (after_frame - before_frame)
+                        
+                        # Handle potential mismatch in number of keypoints between frames
+                        # Use the frame with fewer keypoints and their corresponding indices
+                        if len(before_keypoints['frame_reference_points']) <= len(after_keypoints['frame_reference_points']):
+                            # Before frame has fewer points
+                            interp_frame_points = before_keypoints['frame_reference_points'] * (1 - alpha) + \
+                                             after_keypoints['frame_reference_points'][:len(before_keypoints['frame_reference_points'])] * alpha
+                            pitch_reference_points = before_keypoints['pitch_reference_points']
+                        else:
+                            # After frame has fewer or equal points
+                            interp_frame_points = before_keypoints['frame_reference_points'][:len(after_keypoints['frame_reference_points'])] * (1 - alpha) + \
+                                             after_keypoints['frame_reference_points'] * alpha
+                            pitch_reference_points = after_keypoints['pitch_reference_points']
+                        
+                        # Create transformer with interpolated points
+                        if len(interp_frame_points) >= 4 and len(pitch_reference_points) >= 4:
                             transformer = ViewTransformer(
-                                source=frame_reference_points,
+                                source=interp_frame_points,
                                 target=pitch_reference_points
                             )
+                    elif before_keypoints is not None:
+                        # Only have before keyframe, use it directly
+                        frame_points = before_keypoints['frame_reference_points']
+                        pitch_points = before_keypoints['pitch_reference_points']
+                        
+                        if len(frame_points) >= 4 and len(pitch_points) >= 4:
+                            transformer = ViewTransformer(
+                                source=frame_points,
+                                target=pitch_points
+                            )
+                    elif after_keypoints is not None:
+                        # Only have after keyframe, use it directly
+                        frame_points = after_keypoints['frame_reference_points']
+                        pitch_points = after_keypoints['pitch_reference_points']
+                        
+                        if len(frame_points) >= 4 and len(pitch_points) >= 4:
+                            transformer = ViewTransformer(
+                                source=frame_points,
+                                target=pitch_points
+                            )
+                
+                elif len(keypoint_history) == 1:
+                    # If we only have one keyframe, use it directly
+                    _, keypoints = keypoint_history[0]
+                    frame_points = keypoints['frame_reference_points']
+                    pitch_points = keypoints['pitch_reference_points']
+                    
+                    if len(frame_points) >= 4 and len(pitch_points) >= 4:
+                        transformer = ViewTransformer(
+                            source=frame_points,
+                            target=pitch_points
+                        )
+                
+                # Draw pitch visualization if transformer is available
+                if transformer is not None:
+                    # Create pitch visualization
+                    pitch_frame = draw_pitch(CONFIG)
 
-                            # Create pitch visualization
-                            pitch_frame = draw_pitch(CONFIG)
+                    # Transform and draw ball positions if any detected
+                    if len(data['ball_detections']) > 0:
+                        frame_ball_xy = data['ball_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                        pitch_ball_xy = transformer.transform_points(points=frame_ball_xy)
+                        pitch_frame = draw_points_on_pitch(
+                            config=CONFIG,
+                            xy=pitch_ball_xy,
+                            face_color=sv.Color.WHITE,
+                            edge_color=sv.Color.BLACK,
+                            radius=10,
+                            pitch=pitch_frame)
 
-                            # Transform and draw ball positions if any detected
-                            if len(data['ball_detections']) > 0:
-                                frame_ball_xy = data['ball_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-                                pitch_ball_xy = transformer.transform_points(points=frame_ball_xy)
-                                pitch_frame = draw_points_on_pitch(
-                                    config=CONFIG,
-                                    xy=pitch_ball_xy,
-                                    face_color=sv.Color.WHITE,
-                                    edge_color=sv.Color.BLACK,
-                                    radius=10,
-                                    pitch=pitch_frame)
+                    # Transform and draw team positions
+                    if len(players_detections) > 0:
+                        players_xy = players_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                        pitch_players_xy = transformer.transform_points(points=players_xy)
 
-                            # Transform and draw team positions
-                            if len(players_detections) > 0:
-                                players_xy = players_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-                                pitch_players_xy = transformer.transform_points(points=players_xy)
+                        # Draw team 1 players (class_id == 0)
+                        team1_indices = players_detections.class_id == 0
+                        if np.any(team1_indices):
+                            pitch_frame = draw_points_on_pitch(
+                                config=CONFIG,
+                                xy=pitch_players_xy[team1_indices],
+                                face_color=sv.Color.from_hex('00BFFF'),
+                                edge_color=sv.Color.BLACK,
+                                radius=16,
+                                pitch=pitch_frame)
 
-                                # Draw team 1 players (class_id == 0)
-                                team1_indices = players_detections.class_id == 0
-                                if np.any(team1_indices):
-                                    pitch_frame = draw_points_on_pitch(
-                                        config=CONFIG,
-                                        xy=pitch_players_xy[team1_indices],
-                                        face_color=sv.Color.from_hex('00BFFF'),
-                                        edge_color=sv.Color.BLACK,
-                                        radius=16,
-                                        pitch=pitch_frame)
+                        # Draw team 2 players (class_id == 1)
+                        team2_indices = players_detections.class_id == 1
+                        if np.any(team2_indices):
+                            pitch_frame = draw_points_on_pitch(
+                                config=CONFIG,
+                                xy=pitch_players_xy[team2_indices],
+                                face_color=sv.Color.from_hex('FF1493'),
+                                edge_color=sv.Color.BLACK,
+                                radius=16,
+                                pitch=pitch_frame)
 
-                                # Draw team 2 players (class_id == 1)
-                                team2_indices = players_detections.class_id == 1
-                                if np.any(team2_indices):
-                                    pitch_frame = draw_points_on_pitch(
-                                        config=CONFIG,
-                                        xy=pitch_players_xy[team2_indices],
-                                        face_color=sv.Color.from_hex('FF1493'),
-                                        edge_color=sv.Color.BLACK,
-                                        radius=16,
-                                        pitch=pitch_frame)
+                    # Draw referees
+                    if len(data['referees_detections']) > 0:
+                        referees_xy = data['referees_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                        pitch_referees_xy = transformer.transform_points(points=referees_xy)
+                        pitch_frame = draw_points_on_pitch(
+                            config=CONFIG,
+                            xy=pitch_referees_xy,
+                            face_color=sv.Color.from_hex('FFD700'),
+                            edge_color=sv.Color.BLACK,
+                            radius=16,
+                            pitch=pitch_frame)
 
-                            # Draw referees
-                            if len(data['referees_detections']) > 0:
-                                referees_xy = data['referees_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-                                pitch_referees_xy = transformer.transform_points(points=referees_xy)
-                                pitch_frame = draw_points_on_pitch(
-                                    config=CONFIG,
-                                    xy=pitch_referees_xy,
-                                    face_color=sv.Color.from_hex('FFD700'),
-                                    edge_color=sv.Color.BLACK,
-                                    radius=16,
-                                    pitch=pitch_frame)
+                    # Resize pitch_frame to match original frame dimensions
+                    pitch_frame = cv2.resize(pitch_frame, (frame_width, frame_height))
+                    video_writer_pitch.write(pitch_frame)
 
-                            # Resize pitch_frame to match original frame dimensions
-                            pitch_frame = cv2.resize(pitch_frame, (frame_width, frame_height))
-                            video_writer_pitch.write(pitch_frame)
+                    # Create Voronoi diagram visualization
+                    if len(players_detections) > 0 and np.any(players_detections.class_id == 0) and np.any(players_detections.class_id == 1):
+                        voronoi_frame = draw_pitch(
+                            config=CONFIG,
+                            background_color=sv.Color.WHITE,
+                            line_color=sv.Color.BLACK
+                        )
+                        
+                        voronoi_frame = draw_pitch_voronoi_diagram_2(
+                            config=CONFIG,
+                            team_1_xy=pitch_players_xy[players_detections.class_id == 0],
+                            team_2_xy=pitch_players_xy[players_detections.class_id == 1],
+                            team_1_color=sv.Color.from_hex('00BFFF'),
+                            team_2_color=sv.Color.from_hex('FF1493'),
+                            pitch=voronoi_frame
+                        )
 
-                            # Create Voronoi diagram visualization
-                            if len(players_detections) > 0 and np.any(players_detections.class_id == 0) and np.any(players_detections.class_id == 1):
-                                voronoi_frame = draw_pitch(
-                                    config=CONFIG,
-                                    background_color=sv.Color.WHITE,
-                                    line_color=sv.Color.BLACK
-                                )
-                                
-                                voronoi_frame = draw_pitch_voronoi_diagram_2(
-                                    config=CONFIG,
-                                    team_1_xy=pitch_players_xy[players_detections.class_id == 0],
-                                    team_2_xy=pitch_players_xy[players_detections.class_id == 1],
-                                    team_1_color=sv.Color.from_hex('00BFFF'),
-                                    team_2_color=sv.Color.from_hex('FF1493'),
-                                    pitch=voronoi_frame
-                                )
+                        # Add players and ball to the Voronoi diagram
+                        if len(data['ball_detections']) > 0:
+                            voronoi_frame = draw_points_on_pitch(
+                                config=CONFIG,
+                                xy=pitch_ball_xy,
+                                face_color=sv.Color.WHITE,
+                                edge_color=sv.Color.WHITE,
+                                radius=8,
+                                thickness=1,
+                                pitch=voronoi_frame
+                            )
 
-                                # Add players and ball to the Voronoi diagram
-                                if len(data['ball_detections']) > 0:
-                                    voronoi_frame = draw_points_on_pitch(
-                                        config=CONFIG,
-                                        xy=pitch_ball_xy,
-                                        face_color=sv.Color.WHITE,
-                                        edge_color=sv.Color.WHITE,
-                                        radius=8,
-                                        thickness=1,
-                                        pitch=voronoi_frame
-                                    )
+                        if np.any(players_detections.class_id == 0):
+                            voronoi_frame = draw_points_on_pitch(
+                                config=CONFIG,
+                                xy=pitch_players_xy[players_detections.class_id == 0],
+                                face_color=sv.Color.from_hex('00BFFF'),
+                                edge_color=sv.Color.WHITE,
+                                radius=16,
+                                thickness=1,
+                                pitch=voronoi_frame
+                            )
+                        
+                        if np.any(players_detections.class_id == 1):
+                            voronoi_frame = draw_points_on_pitch(
+                                config=CONFIG,
+                                xy=pitch_players_xy[players_detections.class_id == 1],
+                                face_color=sv.Color.from_hex('FF1493'),
+                                edge_color=sv.Color.WHITE,
+                                radius=16,
+                                thickness=1,
+                                pitch=voronoi_frame
+                            )
 
-                                if np.any(players_detections.class_id == 0):
-                                    voronoi_frame = draw_points_on_pitch(
-                                        config=CONFIG,
-                                        xy=pitch_players_xy[players_detections.class_id == 0],
-                                        face_color=sv.Color.from_hex('00BFFF'),
-                                        edge_color=sv.Color.WHITE,
-                                        radius=16,
-                                        thickness=1,
-                                        pitch=voronoi_frame
-                                    )
-                                
-                                if np.any(players_detections.class_id == 1):
-                                    voronoi_frame = draw_points_on_pitch(
-                                        config=CONFIG,
-                                        xy=pitch_players_xy[players_detections.class_id == 1],
-                                        face_color=sv.Color.from_hex('FF1493'),
-                                        edge_color=sv.Color.WHITE,
-                                        radius=16,
-                                        thickness=1,
-                                        pitch=voronoi_frame
-                                    )
-
-                                # Resize voronoi_frame to match original frame dimensions
-                                voronoi_frame = cv2.resize(voronoi_frame, (frame_width, frame_height))
-                                video_writer_voronoi.write(voronoi_frame)
-                            else:
-                                # If we don't have both teams, just write a copy of the pitch view
-                                video_writer_voronoi.write(pitch_frame)
-                        else:
-                            # Not enough reference points, write blank frames
-                            blank_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-                            video_writer_pitch.write(blank_frame)
-                            video_writer_voronoi.write(blank_frame)
+                        # Resize voronoi_frame to match original frame dimensions
+                        voronoi_frame = cv2.resize(voronoi_frame, (frame_width, frame_height))
+                        video_writer_voronoi.write(voronoi_frame)
                     else:
-                        # No valid key points detected, write blank frames
-                        blank_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-                        video_writer_pitch.write(blank_frame)
-                        video_writer_voronoi.write(blank_frame)
+                        # If we don't have both teams, just write a copy of the pitch view
+                        video_writer_voronoi.write(pitch_frame)
                 else:
-                    # No key points detected, write blank frames
+                    # No field transform available, write blank frames
                     blank_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
                     video_writer_pitch.write(blank_frame)
                     video_writer_voronoi.write(blank_frame)
