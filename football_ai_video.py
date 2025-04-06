@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import os
 import time
+import torch
 
 from scripts.annotators import *
 from scripts.utils import *
@@ -15,9 +16,12 @@ from tqdm import tqdm
 # Create output directory if it doesn't exist
 os.makedirs("output", exist_ok=True)
 
-PLAYER_DETECTION_MODEL = YOLO("models/player_detect/weights/best.pt")
-FIELD_DETECTION_MODEL = YOLO("models/last_400.pt")
+PLAYER_DETECTION_MODEL = YOLO("models/player_detect/weights/best.pt").cuda()
+FIELD_DETECTION_MODEL = YOLO("models/last_400.pt").cuda()
 team_classifier = TeamClassifier.load("models/team_classifier.pkl")
+# Move team classifier to GPU if available
+team_classifier.device = "cuda" if torch.cuda.is_available() else "cpu"
+team_classifier.features_model = team_classifier.features_model.to(team_classifier.device)
 
 SOURCE_VIDEO_PATH = "input/test.mp4"
 BALL_ID = 0
@@ -124,7 +128,8 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
             # Run batch prediction for field detection
             pitch_results = FIELD_DETECTION_MODEL.predict(batch_frames, verbose=False)
             
-            # Process each frame in the batch
+            # Process frame detections first to collect all player crops for batch prediction
+            frame_data = []
             for i, (frame, player_result, pitch_result) in enumerate(zip(batch_frames, player_results, pitch_results)):
                 # Ball, goalkeeper, player, referee detection
                 detections = sv.Detections.from_ultralytics(player_result)
@@ -142,33 +147,66 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                     players_detections = all_detections[all_detections.class_id == PLAYER_ID]
                     referees_detections = all_detections[all_detections.class_id == REFEREE_ID]
 
-                    # Team assignment
+                    # Collect crops for team classification
+                    players_crops = None
                     if len(players_detections) > 0:
                         players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
-                        players_detections.class_id = team_classifier.predict(players_crops)
-
-                        if len(goalkeepers_detections) > 0:
-                            goalkeepers_detections.class_id = resolve_goalkeepers_team_id(
-                                players_detections, goalkeepers_detections)
-
-                    if len(referees_detections) > 0:
-                        referees_detections.class_id -= 1
-
-                    all_detections = sv.Detections.merge([
-                        players_detections, goalkeepers_detections, referees_detections
-                    ])
-
-                    # Frame visualization for annotated video
-                    labels = [f"#{tracker_id}" for tracker_id in all_detections.tracker_id]
-                    all_detections.class_id = all_detections.class_id.astype(int)
+                    
+                    frame_data.append({
+                        'frame': frame,
+                        'ball_detections': ball_detections,
+                        'all_detections': all_detections,
+                        'players_detections': players_detections,
+                        'goalkeepers_detections': goalkeepers_detections,
+                        'referees_detections': referees_detections,
+                        'players_crops': players_crops,
+                        'pitch_result': pitch_result
+                    })
                 else:
-                    players_detections = sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,)))
-                    goalkeepers_detections = sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,)))
-                    referees_detections = sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,)))
-                    all_detections = sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,)))
-                    labels = []
+                    frame_data.append({
+                        'frame': frame,
+                        'ball_detections': ball_detections,
+                        'all_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
+                        'players_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
+                        'goalkeepers_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
+                        'referees_detections': sv.Detections(xyxy=np.empty((0, 4)), class_id=np.empty((0,)), confidence=np.empty((0,))),
+                        'players_crops': None,
+                        'pitch_result': pitch_result
+                    })
+            
+            # Batch predict team classifications
+            all_players_crops = [data['players_crops'] for data in frame_data if data['players_crops'] is not None]
+            if all_players_crops:
+                team_predictions = team_classifier.predict_batch(all_players_crops)
+                
+                # Assign predictions back to the frames
+                pred_idx = 0
+                for i, data in enumerate(frame_data):
+                    if data['players_crops'] is not None:
+                        data['players_detections'].class_id = team_predictions[pred_idx]
+                        pred_idx += 1
+            
+            # Finalize processing for each frame
+            for i, data in enumerate(frame_data):
+                # Team assignment for goalkeepers
+                if len(data['goalkeepers_detections']) > 0 and len(data['players_detections']) > 0:
+                    data['goalkeepers_detections'].class_id = resolve_goalkeepers_team_id(
+                        data['players_detections'], data['goalkeepers_detections'])
 
-                annotated_frame = frame.copy()
+                # Referee ID adjustment
+                if len(data['referees_detections']) > 0:
+                    data['referees_detections'].class_id -= 1
+
+                # Merge all detections
+                all_detections = sv.Detections.merge([
+                    data['players_detections'], data['goalkeepers_detections'], data['referees_detections']
+                ])
+
+                # Frame visualization for annotated video
+                labels = [f"#{tracker_id}" for tracker_id in all_detections.tracker_id]
+                all_detections.class_id = all_detections.class_id.astype(int)
+
+                annotated_frame = data['frame'].copy()
                 annotated_frame = ellipse_annotator.annotate(
                     scene=annotated_frame,
                     detections=all_detections)
@@ -178,17 +216,17 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                     labels=labels)
                 annotated_frame = triangle_annotator.annotate(
                     scene=annotated_frame,
-                    detections=ball_detections)
+                    detections=data['ball_detections'])
 
                 video_writer_annotated.write(annotated_frame)
 
                 # Create merged player detections for both teams
                 players_detections = sv.Detections.merge([
-                    players_detections, goalkeepers_detections
+                    data['players_detections'], data['goalkeepers_detections']
                 ])
 
                 # Process pitch key points
-                key_points = sv.KeyPoints.from_ultralytics(pitch_result)
+                key_points = sv.KeyPoints.from_ultralytics(data['pitch_result'])
 
                 # Make sure we have enough key points for transformation
                 if len(key_points.xy) > 0 and len(key_points.confidence) > 0:
@@ -208,8 +246,8 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                             pitch_frame = draw_pitch(CONFIG)
 
                             # Transform and draw ball positions if any detected
-                            if len(ball_detections) > 0:
-                                frame_ball_xy = ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                            if len(data['ball_detections']) > 0:
+                                frame_ball_xy = data['ball_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
                                 pitch_ball_xy = transformer.transform_points(points=frame_ball_xy)
                                 pitch_frame = draw_points_on_pitch(
                                     config=CONFIG,
@@ -247,8 +285,8 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                                         pitch=pitch_frame)
 
                             # Draw referees
-                            if len(referees_detections) > 0:
-                                referees_xy = referees_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+                            if len(data['referees_detections']) > 0:
+                                referees_xy = data['referees_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
                                 pitch_referees_xy = transformer.transform_points(points=referees_xy)
                                 pitch_frame = draw_points_on_pitch(
                                     config=CONFIG,
@@ -280,7 +318,7 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                                 )
 
                                 # Add players and ball to the Voronoi diagram
-                                if len(ball_detections) > 0:
+                                if len(data['ball_detections']) > 0:
                                     voronoi_frame = draw_points_on_pitch(
                                         config=CONFIG,
                                         xy=pitch_ball_xy,
@@ -301,7 +339,7 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                                         thickness=1,
                                         pitch=voronoi_frame
                                     )
-                                    
+                                
                                 if np.any(players_detections.class_id == 1):
                                     voronoi_frame = draw_points_on_pitch(
                                         config=CONFIG,
