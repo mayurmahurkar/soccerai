@@ -1,0 +1,31 @@
+# Video source and output
+SOURCE_VIDEO_PATH: "input/test.mp4"
+OUTPUT_DIR: "output"
+
+# Output video paths
+OUTPUT_VIDEOS:
+  annotated: "output/annotated.avi"
+  voronoi: "output/voronoi.avi"
+
+# Model paths
+PLAYER_DETECTION_MODEL: "models/player_detect/weights/best.pt"
+FIELD_DETECTION_MODEL: "models/last_400.pt"
+TEAM_CLASSIFIER_MODEL: "models/team_classifier.pkl"
+
+# Detection parameters
+BALL_ID: 0
+GOALKEEPER_ID: 1
+PLAYER_ID: 2
+REFEREE_ID: 3
+BATCH_SIZE: 8  # Process 8 frames at a time
+FIELD_DETECTION_INTERVAL: 5  # Detect field every 5 frames
+CHANGE_THRESHOLD: 0.15  # If frame difference exceeds this, force field detection
+MAP_PITCH: true  # Flag to enable pitch mapping visualization
+VORONOI: false  # Flag to enable voronoi visualization
+
+# Processing
+DEVICE: "cuda"  # Device to use for inference (cuda or cpu)
+
+# Video output settings
+VIDEO_CODEC: "XVID"  # Try with XVID first, fallback to MJPG or 0
+VIDEO_EXTENSION: "avi"
