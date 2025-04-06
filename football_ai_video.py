@@ -16,6 +16,7 @@ from tqdm import tqdm
 # Create output directory if it doesn't exist
 os.makedirs("output", exist_ok=True)
 
+
 PLAYER_DETECTION_MODEL = YOLO("models/player_detect/weights/best.pt").cuda()
 FIELD_DETECTION_MODEL = YOLO("models/last_400.pt").cuda()
 team_classifier = TeamClassifier.load("models/team_classifier.pkl")
@@ -23,7 +24,7 @@ team_classifier = TeamClassifier.load("models/team_classifier.pkl")
 team_classifier.device = "cuda" if torch.cuda.is_available() else "cpu"
 team_classifier.features_model = team_classifier.features_model.to(team_classifier.device)
 
-SOURCE_VIDEO_PATH = "input/test.mp4"
+SOURCE_VIDEO_PATH = "input/test_10sec.mp4"
 BALL_ID = 0
 GOALKEEPER_ID = 1
 PLAYER_ID = 2
@@ -31,6 +32,7 @@ REFEREE_ID = 3
 BATCH_SIZE = 8  # Process 8 frames at a time
 FIELD_DETECTION_INTERVAL = 5  # Detect field every 5 frames
 CHANGE_THRESHOLD = 0.15  # If frame difference exceeds this, force field detection
+MAP_PITCH = False # Flag to enable pitch mapping visualization
 
 tracker = sv.ByteTrack()
 tracker.reset()
@@ -287,8 +289,6 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                     scene=annotated_frame,
                     detections=data['ball_detections'])
 
-                video_writer_annotated.write(annotated_frame)
-
                 # Create merged player detections for both teams
                 players_detections = sv.Detections.merge([
                     data['players_detections'], data['goalkeepers_detections']
@@ -307,10 +307,37 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                             pitch_reference_points = np.array(CONFIG.vertices)[filter_indices]
                             
                             if len(frame_reference_points) >= 4 and len(pitch_reference_points) >= 4:
+                                # For pitch visualization, we need to swap source and target
+                                viz_transformer = ViewTransformer(
+                                    source=pitch_reference_points,
+                                    target=frame_reference_points
+                                )
+                                # For player position mapping, keep original transform direction
                                 transformer = ViewTransformer(
                                     source=frame_reference_points,
                                     target=pitch_reference_points
                                 )
+                                
+                                # Add pitch mapping visualization if enabled
+                                if MAP_PITCH:
+                                    # Get all pitch points and transform them to frame coordinates
+                                    pitch_all_points = np.array(CONFIG.vertices)
+                                    frame_all_points = viz_transformer.transform_points(points=pitch_all_points)
+                                    frame_all_key_points = sv.KeyPoints(xy=frame_all_points[np.newaxis, ...])
+                                    
+                                    # Draw detected keypoints
+                                    frame_reference_key_points = sv.KeyPoints(xy=frame_reference_points[np.newaxis, ...])
+                                    annotated_frame = vertex_annotator.annotate(
+                                        scene=annotated_frame,
+                                        key_points=frame_reference_key_points)
+                                    
+                                    # Draw all pitch lines and points
+                                    annotated_frame = edge_annotator.annotate(
+                                        scene=annotated_frame,
+                                        key_points=frame_all_key_points)
+                                    annotated_frame = vertex_annotator_2.annotate(
+                                        scene=annotated_frame,
+                                        key_points=frame_all_key_points)
                 
                 elif last_keypoints is not None:
                     # Use cached keypoints from the last detected frame
@@ -318,11 +345,40 @@ with tqdm(total=total_frames, desc="Processing frames") as pbar:
                     pitch_points = last_keypoints['pitch_reference_points']
                     
                     if len(frame_points) >= 4 and len(pitch_points) >= 4:
+                        # For pitch visualization, we need to swap source and target
+                        viz_transformer = ViewTransformer(
+                            source=pitch_points,
+                            target=frame_points
+                        )
+                        # For player position mapping, keep original transform direction
                         transformer = ViewTransformer(
                             source=frame_points,
                             target=pitch_points
                         )
-                
+                        
+                        # Add pitch mapping visualization if enabled
+                        if MAP_PITCH:
+                            # Get all pitch points and transform them to frame coordinates
+                            pitch_all_points = np.array(CONFIG.vertices)
+                            frame_all_points = viz_transformer.transform_points(points=pitch_all_points)
+                            frame_all_key_points = sv.KeyPoints(xy=frame_all_points[np.newaxis, ...])
+                            
+                            # Draw cached keypoints
+                            frame_reference_key_points = sv.KeyPoints(xy=frame_points[np.newaxis, ...])
+                            annotated_frame = vertex_annotator.annotate(
+                                scene=annotated_frame,
+                                key_points=frame_reference_key_points)
+                            
+                            # Draw all pitch lines and points
+                            annotated_frame = edge_annotator.annotate(
+                                scene=annotated_frame,
+                                key_points=frame_all_key_points)
+                            annotated_frame = vertex_annotator_2.annotate(
+                                scene=annotated_frame,
+                                key_points=frame_all_key_points)
+
+                video_writer_annotated.write(annotated_frame)
+
                 # Draw pitch visualization if transformer is available
                 if transformer is not None:
                     # Create pitch visualization
