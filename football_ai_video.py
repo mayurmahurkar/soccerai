@@ -98,15 +98,28 @@ def main():
     frame_width, frame_height, fps, total_frames = get_video_info(config["SOURCE_VIDEO_PATH"])
     print(f"Video info: {frame_width}x{frame_height} @ {fps}fps, {total_frames} frames")
     
-    # Setup video writers
-    video_writers, output_paths = setup_video_writers(
-        config["OUTPUT_DIR"], 
-        config["VIDEO_CODEC"], 
-        config["VIDEO_EXTENSION"],
-        frame_width, 
-        frame_height, 
-        fps
+    # Setup video writers based on configuration
+    video_writers = {}
+    output_paths = {}
+    
+    # Create annotated video writer
+    video_writers["annotated"] = cv2.VideoWriter(
+        config["OUTPUT_VIDEOS"]["annotated"],
+        cv2.VideoWriter_fourcc(*config["VIDEO_CODEC"]),
+        fps,
+        (frame_width, frame_height)
     )
+    output_paths["annotated"] = config["OUTPUT_VIDEOS"]["annotated"]
+    
+    # Only create voronoi video writer if enabled in config
+    if config.get("VORONOI", False):
+        video_writers["voronoi"] = cv2.VideoWriter(
+            config["OUTPUT_VIDEOS"]["voronoi"],
+            cv2.VideoWriter_fourcc(*config["VIDEO_CODEC"]),
+            fps,
+            (frame_width, frame_height)
+        )
+        output_paths["voronoi"] = config["OUTPUT_VIDEOS"]["voronoi"]
     
     # Class IDs mapping
     class_ids = {
@@ -151,7 +164,8 @@ def main():
                 last_keypoints, 
                 config["MAP_PITCH"],
                 class_ids,
-                CONFIG
+                CONFIG,
+                enable_voronoi=config.get("VORONOI", False)  # Pass voronoi flag to visualization
             )
     
     end_time = time.time()

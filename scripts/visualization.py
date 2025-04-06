@@ -2,9 +2,9 @@ import supervision as sv
 import numpy as np
 import cv2
 
-from scripts.football_pitch import draw_pitch, draw_points_on_pitch, draw_pitch_voronoi_diagram_2
-from scripts.annotators import vertex_annotator, edge_annotator, vertex_annotator_2
-from scripts.annotators import ellipse_annotator, label_annotator, triangle_annotator
+from scripts.football_pitch import draw_pitch, draw_points_on_pitch, draw_pitch_voronoi_diagram, draw_pitch_voronoi_diagram_2
+from scripts.annotators import CONFIG, vertex_annotator, edge_annotator, vertex_annotator_2
+from scripts.annotators import ellipse_annotator, label_annotator, triangle_annotator, box_annotator
 from scripts.utils import resolve_goalkeepers_team_id
 from scripts.field_detection import create_transformers
 from scripts.view import ViewTransformer
@@ -42,7 +42,7 @@ def add_pitch_mapping_visualization(frame, keypoints, viz_transformer, config):
     return annotated_frame
 
 
-def process_frame_visualizations(frame_data, video_writers, last_keypoints, map_pitch, class_ids, config):
+def process_frame_visualizations(frame_data, video_writers, last_keypoints, map_pitch, class_ids, config, enable_voronoi=False):
     """
     Process and visualize each frame in the batch.
     
@@ -53,6 +53,7 @@ def process_frame_visualizations(frame_data, video_writers, last_keypoints, map_
         map_pitch: Whether to enable pitch mapping visualization
         class_ids: Dictionary mapping class names to IDs
         config: Pitch configuration
+        enable_voronoi: Whether to enable voronoi visualization
     """
     for data in frame_data:
         # Team assignment for goalkeepers
@@ -138,9 +139,10 @@ def process_frame_visualizations(frame_data, video_writers, last_keypoints, map_
                 )
 
         video_writers["annotated"].write(annotated_frame)
-
-        # Draw pitch visualization if transformer is available
-        if transformer is not None:
+        
+        # Only process voronoi visualizations if enabled
+        if enable_voronoi and transformer is not None:
+            # Create pitch visualization
             visualize_pitch(
                 data=data, 
                 players_detections=players_detections,
@@ -149,15 +151,15 @@ def process_frame_visualizations(frame_data, video_writers, last_keypoints, map_
                 config=config
             )
         else:
-            # No field transform available, write blank frames
-            blank_frame = np.zeros((data['frame'].shape[0], data['frame'].shape[1], 3), dtype=np.uint8)
-            video_writers["pitch"].write(blank_frame)
-            video_writers["voronoi"].write(blank_frame)
+            # If voronoi is enabled but no transformer is available, write blank frames
+            if enable_voronoi and "voronoi" in video_writers:
+                blank_frame = np.zeros((data['frame'].shape[0], data['frame'].shape[1], 3), dtype=np.uint8)
+                video_writers["voronoi"].write(blank_frame)
 
 
 def visualize_pitch(data, players_detections, transformer, video_writers, config):
     """
-    Create and write pitch visualization and Voronoi diagram.
+    Create and write pitch visualization with player and ball positions.
     
     Args:
         data: Detection data for the current frame
@@ -166,10 +168,15 @@ def visualize_pitch(data, players_detections, transformer, video_writers, config
         video_writers: Dictionary of video writers
         config: Pitch configuration
     """
+    # Only process if voronoi writer exists
+    if "voronoi" not in video_writers:
+        return
+        
     # Create pitch visualization
     pitch_frame = draw_pitch(config)
 
     # Transform and draw ball positions if any detected
+    pitch_ball_xy = None
     if len(data['ball_detections']) > 0:
         frame_ball_xy = data['ball_detections'].get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
         pitch_ball_xy = transformer.transform_points(points=frame_ball_xy)
@@ -221,45 +228,10 @@ def visualize_pitch(data, players_detections, transformer, video_writers, config
             radius=16,
             pitch=pitch_frame)
 
-    # Resize pitch_frame to match original frame dimensions
-    pitch_frame = cv2.resize(pitch_frame, (data['frame'].shape[1], data['frame'].shape[0]))
-    video_writers["pitch"].write(pitch_frame)
-
-    # Create Voronoi diagram visualization
-    create_voronoi_visualization(
-        data=data,
-        players_detections=players_detections,
-        pitch_players_xy=pitch_players_xy,
-        pitch_ball_xy=pitch_ball_xy if len(data['ball_detections']) > 0 else None,
-        video_writers=video_writers,
-        pitch_frame=pitch_frame,
-        config=config
-    )
-
-
-def create_voronoi_visualization(data, players_detections, pitch_players_xy, pitch_ball_xy, 
-                                video_writers, pitch_frame, config):
-    """
-    Create and write Voronoi diagram visualization.
-    
-    Args:
-        data: Detection data for the current frame
-        players_detections: Merged player detections
-        pitch_players_xy: Player coordinates in pitch space
-        pitch_ball_xy: Ball coordinates in pitch space
-        video_writers: Dictionary of video writers
-        pitch_frame: The pitch visualization frame
-        config: Pitch configuration
-    """
+    # Create Voronoi diagram if both teams have players detected
     if (pitch_players_xy is not None and len(players_detections) > 0 and 
             np.any(players_detections.class_id == 0) and 
             np.any(players_detections.class_id == 1)):
-        
-        voronoi_frame = draw_pitch(
-            config=config,
-            background_color=sv.Color.WHITE,
-            line_color=sv.Color.BLACK
-        )
         
         voronoi_frame = draw_pitch_voronoi_diagram_2(
             config=config,
@@ -267,46 +239,14 @@ def create_voronoi_visualization(data, players_detections, pitch_players_xy, pit
             team_2_xy=pitch_players_xy[players_detections.class_id == 1],
             team_1_color=sv.Color.from_hex('00BFFF'),
             team_2_color=sv.Color.from_hex('FF1493'),
-            pitch=voronoi_frame
+            opacity=0.5,
+            pitch=pitch_frame
         )
-
-        # Add players and ball to the Voronoi diagram
-        if pitch_ball_xy is not None:
-            voronoi_frame = draw_points_on_pitch(
-                config=config,
-                xy=pitch_ball_xy,
-                face_color=sv.Color.WHITE,
-                edge_color=sv.Color.WHITE,
-                radius=8,
-                thickness=1,
-                pitch=voronoi_frame
-            )
-
-        if np.any(players_detections.class_id == 0):
-            voronoi_frame = draw_points_on_pitch(
-                config=config,
-                xy=pitch_players_xy[players_detections.class_id == 0],
-                face_color=sv.Color.from_hex('00BFFF'),
-                edge_color=sv.Color.WHITE,
-                radius=16,
-                thickness=1,
-                pitch=voronoi_frame
-            )
         
-        if np.any(players_detections.class_id == 1):
-            voronoi_frame = draw_points_on_pitch(
-                config=config,
-                xy=pitch_players_xy[players_detections.class_id == 1],
-                face_color=sv.Color.from_hex('FF1493'),
-                edge_color=sv.Color.WHITE,
-                radius=16,
-                thickness=1,
-                pitch=voronoi_frame
-            )
-
-        # Resize voronoi_frame to match original frame dimensions
+        # Resize to match original frame dimensions
         voronoi_frame = cv2.resize(voronoi_frame, (data['frame'].shape[1], data['frame'].shape[0]))
         video_writers["voronoi"].write(voronoi_frame)
     else:
-        # If we don't have both teams, just write a copy of the pitch view
+        # If we don't have both teams, just write the basic pitch with players
+        pitch_frame = cv2.resize(pitch_frame, (data['frame'].shape[1], data['frame'].shape[0]))
         video_writers["voronoi"].write(pitch_frame) 

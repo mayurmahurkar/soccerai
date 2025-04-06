@@ -1,5 +1,6 @@
 import supervision as sv
 import numpy as np
+import cv2
 from scripts.view import ViewTransformer
 from scripts.video_utils import frames_differ_significantly
 
@@ -41,27 +42,37 @@ def create_transformers(keypoints):
     Create view transformers from keypoints.
     
     Args:
-        keypoints: Dictionary of keypoints (frame_reference_points and pitch_reference_points)
+        keypoints: Dictionary containing frame and pitch reference points
         
     Returns:
-        Tuple of (frame-to-pitch transformer, pitch-to-frame transformer)
+        Tuple of (transformer, viz_transformer) or (None, None) if not enough points
     """
-    if keypoints is None or 'frame_reference_points' not in keypoints:
+    if keypoints is None:
+        return None, None
+        
+    frame_reference_points = keypoints['frame_reference_points']
+    pitch_reference_points = keypoints['pitch_reference_points']
+    
+    if len(frame_reference_points) < 4 or len(pitch_reference_points) < 4:
         return None, None
     
-    frame_points = keypoints['frame_reference_points']
-    pitch_points = keypoints['pitch_reference_points']
-    
-    if len(frame_points) < 4 or len(pitch_points) < 4:
+    try:
+        # For player position mapping
+        transformer = ViewTransformer(
+            source=frame_reference_points,
+            target=pitch_reference_points
+        )
+        
+        # For pitch visualization (reverse direction)
+        viz_transformer = ViewTransformer(
+            source=pitch_reference_points,
+            target=frame_reference_points
+        )
+        
+        return transformer, viz_transformer
+    except Exception as e:
+        print(f"Error creating transformers: {e}")
         return None, None
-    
-    # For player position mapping (frame to pitch)
-    transformer = ViewTransformer(source=frame_points, target=pitch_points)
-    
-    # For pitch visualization (pitch to frame)
-    viz_transformer = ViewTransformer(source=pitch_points, target=frame_points)
-    
-    return transformer, viz_transformer
 
 
 def determine_frames_needing_detection(batch_frames, frame_count, batch_size, 
