@@ -75,7 +75,8 @@ class TeamClassifier:
         batches = create_batches(crops, self.batch_size)
         data = []
         with torch.no_grad():
-            for batch in tqdm(batches, desc='Embedding extraction'):
+            # for batch in tqdm(batches, desc='Embedding extraction'):
+            for batch in batches:
                 inputs = self.processor(
                     images=batch, return_tensors="pt").to(self.device)
                 outputs = self.features_model(**inputs)
